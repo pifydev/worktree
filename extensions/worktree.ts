@@ -28,7 +28,7 @@ import {
   removeWorktree,
   repoToplevel,
 } from "../src/git.ts";
-import { assessRemoval, formatWorktrees, validBranchName } from "../src/parse.ts";
+import { assessRemoval, formatWorktrees, resolveWorktree, validBranchName } from "../src/parse.ts";
 
 type UiContext = ExtensionContext;
 
@@ -46,11 +46,60 @@ export default function worktree(pi: ExtensionAPI) {
   }
 
   function resolveTarget(ctx: UiContext, target: string) {
+    return resolveWorktree(listWorktrees(ctx.cwd), target);
+  }
+
+  /**
+   * Merge a worktree branch back into the primary worktree and remove the
+   * worktree. Shared by the tool and the /worktree route so both halves of
+   * the isolation loop behave identically. Throws on anything unsafe.
+   */
+  async function mergeWorktree(
+    ctx: UiContext,
+    rawBranch: string,
+  ): Promise<{ text: string; branch: string; removed: boolean; merged: boolean }> {
+    requireRepo(ctx);
+    const branch = rawBranch.trim();
+    if (!validBranchName(branch)) throw new Error(`Invalid branch name ${JSON.stringify(rawBranch)}.`);
+
     const worktrees = listWorktrees(ctx.cwd);
-    const norm = (p: string) => p.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
-    return worktrees.find(
-      (w) => w.branch === target || norm(w.path) === norm(target),
+    const primary = worktrees.find((w) => w.primary);
+    const source = resolveWorktree(worktrees, branch);
+    if (!primary) throw new Error("Could not locate the primary worktree.");
+    if (!source) throw new Error(`No worktree has branch "${branch}". Use worktree_list.`);
+    if (source.primary) throw new Error("That is the primary worktree's own branch.");
+    if (isDirty(source.path)) {
+      throw new Error(`Worktree ${source.path} has uncommitted changes — commit them there first.`);
+    }
+    if (isDirty(primary.path)) {
+      throw new Error(`The primary worktree has uncommitted changes — commit or stash them first.`);
+    }
+    if (!ctx.hasUI) {
+      throw new Error("Merging needs the user's confirmation and no UI is available (fail-closed).");
+    }
+
+    const sourceBranch = source.branch ?? branch;
+    const approved = await ctx.ui.confirm(
+      "Merge worktree",
+      `Merge branch "${sourceBranch}" into "${primary.branch ?? "the primary branch"}" and remove ${source.path}?`,
     );
+    if (!approved) {
+      return { text: "The user declined the merge.", branch: sourceBranch, removed: false, merged: false };
+    }
+
+    const merge = mergeBranch(primary.path, sourceBranch);
+    if (!merge.ok) throw new Error(merge.message);
+
+    const removal = removeWorktree(ctx.cwd, source.path, false);
+    const cleanup = removal.ok
+      ? `Worktree ${source.path} removed (branch kept).`
+      : `Merge done, but removing the worktree failed: ${removal.output}`;
+    return {
+      text: `Merged "${sourceBranch}" into ${primary.branch ?? "primary"}.\n${cleanup}`,
+      branch: sourceBranch,
+      removed: removal.ok,
+      merged: true,
+    };
   }
 
   // ── Tools ────────────────────────────────────────────────────────────
@@ -169,45 +218,10 @@ export default function worktree(pi: ExtensionAPI) {
       branch: Type.String({ description: "Branch of the worktree to merge back" }),
     }),
     async execute(_id, params: { branch: string }, _signal, _onUpdate, ctx) {
-      const uiCtx = ctx as UiContext;
-      requireRepo(uiCtx);
-      const branch = params.branch.trim();
-      if (!validBranchName(branch)) throw new Error(`Invalid branch name ${JSON.stringify(params.branch)}.`);
-
-      const worktrees = listWorktrees(uiCtx.cwd);
-      const primary = worktrees.find((w) => w.primary);
-      const source = worktrees.find((w) => w.branch === branch);
-      if (!primary) throw new Error("Could not locate the primary worktree.");
-      if (!source) throw new Error(`No worktree has branch "${branch}". Use worktree_list.`);
-      if (source.primary) throw new Error("That is the primary worktree's own branch.");
-      if (isDirty(source.path)) {
-        throw new Error(`Worktree ${source.path} has uncommitted changes — commit them there first.`);
-      }
-      if (isDirty(primary.path)) {
-        throw new Error(`The primary worktree has uncommitted changes — commit or stash them first.`);
-      }
-
-      if (!uiCtx.hasUI) {
-        throw new Error("Merging needs the user's confirmation and no UI is available (fail-closed).");
-      }
-      const approved = await uiCtx.ui.confirm(
-        "Merge worktree",
-        `Merge branch "${branch}" into "${primary.branch ?? "the primary branch"}" and remove ${source.path}?`,
-      );
-      if (!approved) {
-        return { content: [{ type: "text", text: "The user declined the merge." }], details: {} };
-      }
-
-      const merge = mergeBranch(primary.path, branch);
-      if (!merge.ok) throw new Error(merge.message);
-
-      const removal = removeWorktree(uiCtx.cwd, source.path, false);
-      const cleanup = removal.ok
-        ? `Worktree ${source.path} removed (branch kept).`
-        : `Merge done, but removing the worktree failed: ${removal.output}`;
+      const result = await mergeWorktree(ctx as UiContext, params.branch);
       return {
-        content: [{ type: "text", text: `Merged "${branch}" into ${primary.branch ?? "primary"}.\n${cleanup}` }],
-        details: { branch, removed: removal.ok },
+        content: [{ type: "text", text: result.text }],
+        details: { branch: result.branch, merged: result.merged, removed: result.removed },
       };
     },
   });
@@ -215,23 +229,31 @@ export default function worktree(pi: ExtensionAPI) {
   // ── Command ──────────────────────────────────────────────────────────
 
   pi.registerCommand("worktree", {
-    description: "Manage git worktrees: /worktree [create <branch> | remove <target> | prune]",
+    description: "Manage git worktrees: /worktree [create <branch> [base] | remove <target> | merge <branch> | prune]",
     handler: async (args, ctx) => {
       if (!ctx.hasUI) return;
-      const [route, arg] = (args ?? "").trim().split(/\s+/);
+      const text = (args ?? "").trim();
+      const route = (text.split(/\s+/)[0] ?? "").toLowerCase();
+      // Keep the remainder whole: worktree paths contain spaces on Windows.
+      const rest = text.slice(route.length).trim();
       try {
         requireRepo(ctx);
-        switch ((route || "list").toLowerCase()) {
+        switch (route || "list") {
           case "list": {
             ctx.ui.notify(listText(ctx), "info");
             return;
           }
           case "create": {
-            if (!arg || !validBranchName(arg)) {
-              ctx.ui.notify("Usage: /worktree create <branch>", "warning");
+            const [arg, base] = rest.split(/\s+/);
+            if (!arg) {
+              ctx.ui.notify("Usage: /worktree create <branch> [base]", "warning");
               return;
             }
-            const result = createWorktree(ctx.cwd, arg);
+            if (!validBranchName(arg)) {
+              ctx.ui.notify(`Invalid branch name "${arg}".`, "warning");
+              return;
+            }
+            const result = createWorktree(ctx.cwd, arg, base);
             ctx.ui.notify(
               result.ok ? `Worktree ready: ${result.path}\nOpen with: cd "${result.path}" && pi` : result.message,
               result.ok ? "info" : "error",
@@ -239,13 +261,13 @@ export default function worktree(pi: ExtensionAPI) {
             return;
           }
           case "remove": {
-            if (!arg) {
+            if (!rest) {
               ctx.ui.notify("Usage: /worktree remove <branch|path>", "warning");
               return;
             }
-            const target = resolveTarget(ctx, arg);
+            const target = resolveTarget(ctx, rest);
             if (!target) {
-              ctx.ui.notify(`No worktree matches "${arg}".`, "warning");
+              ctx.ui.notify(`No worktree matches "${rest}".`, "warning");
               return;
             }
             const dirty = isDirty(target.path);
@@ -265,13 +287,25 @@ export default function worktree(pi: ExtensionAPI) {
             ctx.ui.notify(result.ok ? `Removed ${target.path}.` : result.output, result.ok ? "info" : "error");
             return;
           }
+          case "merge": {
+            if (!rest) {
+              ctx.ui.notify("Usage: /worktree merge <branch>", "warning");
+              return;
+            }
+            const result = await mergeWorktree(ctx, rest);
+            ctx.ui.notify(result.text, "info");
+            return;
+          }
           case "prune": {
             const result = pruneWorktrees(ctx.cwd);
             ctx.ui.notify(result.output || "Nothing to prune.", result.ok ? "info" : "error");
             return;
           }
           default:
-            ctx.ui.notify("Usage: /worktree [create <branch> | remove <target> | prune]", "warning");
+            ctx.ui.notify(
+              `Unknown route "${route}". Usage: /worktree [list | create <branch> [base] | remove <target> | merge <branch> | prune]`,
+              "warning",
+            );
         }
       } catch (err) {
         ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");

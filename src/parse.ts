@@ -87,6 +87,45 @@ export interface RemovalRisk {
   confirmable: boolean;
 }
 
+/** Compare paths the way the local filesystem does (Windows-insensitive). */
+export function normalizePath(path: string): string {
+  return path.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/**
+ * Is `childPath` the same as, or under, `parentPath`? Plain string prefixing
+ * would read `.../feature-2` as living inside `.../feature`, and worktrees are
+ * generated as exactly those siblings.
+ */
+export function isInside(childPath: string, parentPath: string): boolean {
+  const child = normalizePath(childPath);
+  const parent = normalizePath(parentPath);
+  return child === parent || child.startsWith(`${parent}/`);
+}
+
+/**
+ * Find the worktree a user means: an exact branch, a branch under a known
+ * namespace ("worker-1" for "agent/worker-1"), a path, or a directory name.
+ */
+export function resolveWorktree(
+  worktrees: WorktreeInfo[],
+  target: string,
+  prefixes: string[] = ["agent/"],
+): WorktreeInfo | null {
+  const wanted = target.trim();
+  if (!wanted) return null;
+  const byBranch = worktrees.find((w) => w.branch === wanted);
+  if (byBranch) return byBranch;
+  for (const prefix of prefixes) {
+    const namespaced = worktrees.find((w) => w.branch === `${prefix}${wanted}`);
+    if (namespaced) return namespaced;
+  }
+  const normalized = normalizePath(wanted);
+  const byPath = worktrees.find((w) => normalizePath(w.path) === normalized);
+  if (byPath) return byPath;
+  return worktrees.find((w) => normalizePath(w.path).split("/").pop() === normalized) ?? null;
+}
+
 /** Assess whether a worktree can be removed safely (narumiruna's rails). */
 export function assessRemoval(
   target: WorktreeInfo,
@@ -94,10 +133,9 @@ export function assessRemoval(
   dirty: boolean,
 ): RemovalRisk {
   const reasons: string[] = [];
-  const norm = (p: string) => p.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
 
   if (target.primary) reasons.push("it is the primary worktree");
-  if (norm(currentCwd).startsWith(norm(target.path))) {
+  if (isInside(currentCwd, target.path)) {
     reasons.push("the current session is running inside it");
   }
   if (target.locked) reasons.push("it is locked (git worktree lock)");

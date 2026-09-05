@@ -7,6 +7,8 @@ import { join } from "node:path";
 import {
   assessRemoval,
   branchToDirName,
+  isInside,
+  resolveWorktree,
   formatWorktrees,
   parseWorktreeList,
   validBranchName,
@@ -172,4 +174,37 @@ test("conflicting merge aborts cleanly", () => {
     rmSync(repo, { recursive: true, force: true });
     for (const p of created) rmSync(p, { recursive: true, force: true });
   }
+});
+
+test("v0.2 isInside respects directory boundaries", () => {
+  assert.equal(isInside("/repo/wt", "/repo/wt"), true);
+  assert.equal(isInside("/repo/wt/sub/dir", "/repo/wt"), true);
+  assert.equal(isInside("/repo/wt/", "/repo/wt"), true);
+  // the sibling case worktree generation actually produces
+  assert.equal(isInside("/repo/feature-2", "/repo/feature"), false);
+  assert.equal(isInside("/repo/other", "/repo/wt"), false);
+  // Windows paths and case
+  assert.equal(isInside("C:\\Users\\a\\.worktrees\\repo\\x\\src", "C:/Users/A/.worktrees/repo/x"), true);
+});
+
+test("v0.2 a sibling worktree is removable", () => {
+  const target = info({ path: "/repo/feature" });
+  const risk = assessRemoval(target, "/repo/feature-2", false);
+  assert.deepEqual(risk, { ok: true, reasons: [], confirmable: false });
+});
+
+test("v0.2 resolveWorktree matches branch, namespace, path, and dir name", () => {
+  const trees = [
+    info({ path: "/repo", branch: "main", primary: true }),
+    info({ path: "C:/Users/a/.worktrees/repo/worker-1", branch: "agent/worker-1" }),
+    info({ path: "/repo/wt-feature", branch: "feature/x" }),
+  ];
+  assert.equal(resolveWorktree(trees, "feature/x")!.path, "/repo/wt-feature");
+  // isolate.ts names branches agent/<slug>; the slug alone should find it
+  assert.equal(resolveWorktree(trees, "worker-1")!.branch, "agent/worker-1");
+  assert.equal(resolveWorktree(trees, "agent/worker-1")!.branch, "agent/worker-1");
+  assert.equal(resolveWorktree(trees, "c:\\users\\a\\.worktrees\\repo\\worker-1")!.branch, "agent/worker-1");
+  assert.equal(resolveWorktree(trees, "wt-feature")!.branch, "feature/x");
+  assert.equal(resolveWorktree(trees, "nope"), null);
+  assert.equal(resolveWorktree(trees, "  "), null);
 });
