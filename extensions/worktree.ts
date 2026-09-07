@@ -16,7 +16,14 @@
  * (@narumitw/pi-worktree), merge-back cleanup flow (rielj/pi-git-worktrees,
  * minus the tmux), worktree-as-concurrency-safety framing (pi-napkin).
  */
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  SessionManager,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { existsSync, statSync } from "node:fs";
+
 import { Type } from "typebox";
 
 import {
@@ -29,8 +36,17 @@ import {
   repoToplevel,
 } from "../src/git.ts";
 import { assessRemoval, formatWorktrees, resolveWorktree, validBranchName } from "../src/parse.ts";
+import {
+  WORKTREE_SESSION_ENTRY,
+  enteredNote,
+  exitNote,
+  planEnter,
+  readWorktreeSession,
+  type WorktreeSession,
+} from "../src/enter.ts";
 
 type UiContext = ExtensionContext;
+type CommandContext = ExtensionCommandContext;
 
 export default function worktree(pi: ExtensionAPI) {
   function requireRepo(ctx: UiContext): string {
@@ -102,6 +118,81 @@ export default function worktree(pi: ExtensionAPI) {
     };
   }
 
+  /**
+   * Enter a worktree by forking this session into it. pi binds its built-in
+   * tools to the session cwd and a session cannot change its own, so the only
+   * way to take the conversation along is a replacement session.
+   */
+  async function enterWorktree(ctx: CommandContext, wanted: string, created = false): Promise<void> {
+    requireRepo(ctx);
+    if (typeof ctx.switchSession !== "function") {
+      ctx.ui.notify("This pi build cannot switch sessions, so /worktree enter is unavailable.", "error");
+      return;
+    }
+
+    const match = resolveWorktree(listWorktrees(ctx.cwd), wanted);
+    const file = ctx.sessionManager.getSessionFile() ?? null;
+    const plan = planEnter(
+      ctx.cwd,
+      { file, onDisk: Boolean(file && existsSync(file) && statSync(file).size > 0) },
+      match ? { path: match.path, branch: match.branch } : null,
+    );
+    if ("kind" in plan) {
+      ctx.ui.notify(plan.message, plan.kind === "already-here" ? "info" : "warning");
+      return;
+    }
+
+    const state: WorktreeSession = {
+      path: plan.target.path,
+      branch: plan.target.branch,
+      parentSession: plan.parentSession,
+      created,
+      enteredAt: Date.now(),
+    };
+
+    try {
+      // forkFrom copies the conversation into a session file rooted at the
+      // worktree; switching to it is what rebinds read/edit/bash and @.
+      const replacement = SessionManager.forkFrom(plan.parentSession, state.path);
+      const replacementFile = replacement.getSessionFile();
+      if (!replacementFile) throw new Error("the forked session has no file");
+      replacement.appendCustomEntry(WORKTREE_SESSION_ENTRY, state);
+      const { cancelled } = await ctx.switchSession(replacementFile, {
+        withSession: async (next) => {
+          next.ui.notify(enteredNote(state), "info");
+        },
+      });
+      if (cancelled) ctx.ui.notify("Staying put — the session switch was cancelled.", "info");
+    } catch (err) {
+      ctx.ui.notify(`Could not enter: ${err instanceof Error ? err.message : String(err)}`, "error");
+    }
+  }
+
+  /** Return to the session this one was forked from. */
+  async function exitWorktree(ctx: CommandContext): Promise<void> {
+    const state = readWorktreeSession(ctx.sessionManager.getBranch() as never);
+    if (!state) {
+      ctx.ui.notify("This session was not entered with /worktree enter.", "warning");
+      return;
+    }
+    if (!state.parentSession || !existsSync(state.parentSession)) {
+      ctx.ui.notify(
+        "The session this was forked from is gone, so there is nowhere to go back to. This session stays in the worktree.",
+        "warning",
+      );
+      return;
+    }
+    try {
+      await ctx.switchSession(state.parentSession, {
+        withSession: async (next) => {
+          next.ui.notify(exitNote(state), "info");
+        },
+      });
+    } catch (err) {
+      ctx.ui.notify(`Could not exit: ${err instanceof Error ? err.message : String(err)}`, "error");
+    }
+  }
+
   // ── Tools ────────────────────────────────────────────────────────────
 
   pi.registerTool({
@@ -146,7 +237,10 @@ export default function worktree(pi: ExtensionAPI) {
             type: "text",
             text: [
               `Worktree ready at ${result.path} (${result.message} base: ${result.base}).`,
-              `Open a pi session there with: cd "${result.path}" && pi`,
+              // Only the user can switch sessions, so tell them how rather than
+              // implying this session moved.
+              `Your tools still point at the main checkout. The user can run /worktree enter ${branch} to ` +
+                `bring this conversation into the worktree, or open it separately with: cd "${result.path}" && pi`,
               `When the work is done: worktree_merge branch="${branch}" merges it back and cleans up.`,
             ].join("\n"),
           },
@@ -229,7 +323,8 @@ export default function worktree(pi: ExtensionAPI) {
   // ── Command ──────────────────────────────────────────────────────────
 
   pi.registerCommand("worktree", {
-    description: "Manage git worktrees: /worktree [create <branch> [base] | remove <target> | merge <branch> | prune]",
+    description:
+      "Manage git worktrees: /worktree [create <branch> [base] [--enter] | enter <target> | exit | remove <target> | merge <branch> | prune]",
     handler: async (args, ctx) => {
       if (!ctx.hasUI) return;
       const text = (args ?? "").trim();
@@ -244,9 +339,11 @@ export default function worktree(pi: ExtensionAPI) {
             return;
           }
           case "create": {
-            const [arg, base] = rest.split(/\s+/);
+            const words = rest.split(/\s+/).filter(Boolean);
+            const enterAfter = words.includes("--enter");
+            const [arg, base] = words.filter((w) => w !== "--enter");
             if (!arg) {
-              ctx.ui.notify("Usage: /worktree create <branch> [base]", "warning");
+              ctx.ui.notify("Usage: /worktree create <branch> [base] [--enter]", "warning");
               return;
             }
             if (!validBranchName(arg)) {
@@ -254,9 +351,19 @@ export default function worktree(pi: ExtensionAPI) {
               return;
             }
             const result = createWorktree(ctx.cwd, arg, base);
+            if (!result.ok) {
+              ctx.ui.notify(result.message, "error");
+              return;
+            }
+            if (enterAfter) {
+              ctx.ui.notify(`Worktree ready: ${result.path}`, "info");
+              await enterWorktree(ctx, arg, true);
+              return;
+            }
             ctx.ui.notify(
-              result.ok ? `Worktree ready: ${result.path}\nOpen with: cd "${result.path}" && pi` : result.message,
-              result.ok ? "info" : "error",
+              `Worktree ready: ${result.path}\n` +
+                `/worktree enter ${arg} takes this conversation there, or open it separately with: cd "${result.path}" && pi`,
+              "info",
             );
             return;
           }
@@ -287,6 +394,18 @@ export default function worktree(pi: ExtensionAPI) {
             ctx.ui.notify(result.ok ? `Removed ${target.path}.` : result.output, result.ok ? "info" : "error");
             return;
           }
+          case "enter": {
+            if (!rest) {
+              ctx.ui.notify("Usage: /worktree enter <branch|path>", "warning");
+              return;
+            }
+            await enterWorktree(ctx, rest);
+            return;
+          }
+          case "exit": {
+            await exitWorktree(ctx);
+            return;
+          }
           case "merge": {
             if (!rest) {
               ctx.ui.notify("Usage: /worktree merge <branch>", "warning");
@@ -303,7 +422,7 @@ export default function worktree(pi: ExtensionAPI) {
           }
           default:
             ctx.ui.notify(
-              `Unknown route "${route}". Usage: /worktree [list | create <branch> [base] | remove <target> | merge <branch> | prune]`,
+              `Unknown route "${route}". Usage: /worktree [list | create <branch> [base] [--enter] | enter <target> | exit | remove <target> | merge <branch> | prune]`,
               "warning",
             );
         }

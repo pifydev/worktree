@@ -21,13 +21,16 @@ edits.
 
 1. `worktree_list` — see what exists (primary, dirty, locked flags).
 2. `worktree_create branch="feature-x"` — new branch from HEAD (or pass
-   `base`), checked out under `~/.worktrees/<repo>/`. Tell the user the
-   path — they can run pi there (`cd <path> && pi`).
-3. Work happens in the worktree; commit there.
-4. `worktree_merge branch="feature-x"` — asks the user, merges into the
+   `base`), checked out under `~/.worktrees/<repo>/`.
+3. Say where the worktree is and that your tools still point at the main
+   checkout. Only the user can move this session: `/worktree enter feature-x`
+   brings the conversation into the worktree, `/worktree exit` returns.
+   Otherwise they can open it separately with `cd <path> && pi`.
+4. Work happens in the worktree; commit there.
+5. `worktree_merge branch="feature-x"` — asks the user, merges into the
    primary branch, removes the worktree. Conflicts abort cleanly; nothing
    is left half-merged.
-5. `worktree_remove target="feature-x"` — abandon instead; dirty worktrees
+6. `worktree_remove target="feature-x"` — abandon instead; dirty worktrees
    need the user's confirmation, the branch is always kept.
 
 ## Rules
@@ -35,3 +38,5 @@ edits.
 - Never try to bypass a refusal (primary/current/locked worktrees).
 - Commit inside the worktree before merging — both sides must be clean.
 - One branch per worktree; a branch already checked out elsewhere refuses.
+- Do not claim you are "now working in" a worktree you created. Until the user
+  enters it, every path you read and edit is still the main checkout.
