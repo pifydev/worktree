@@ -1,6 +1,6 @@
 ---
 name: worktree
-description: Use when work should happen in isolation from the main checkout - risky refactors, parallel efforts, or long-running changes - explains the worktree tools, safety rails, and the merge-back flow
+description: Use when work should happen in isolation from the main checkout - risky refactors, parallel efforts, or long-running changes
 ---
 
 # Git worktrees
