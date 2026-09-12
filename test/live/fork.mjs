@@ -88,7 +88,7 @@ try {
     readWorktreeSession(reopened.getBranch())?.path === worktree,
   );
 } finally {
-  rmSync(root, { recursive: true, force: true });
+  rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 }
 
 console.log(`\n${passed}/${passed + failed} passed`);
