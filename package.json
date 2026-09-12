@@ -1,6 +1,6 @@
 {
   "name": "@pify/worktree",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Safe git-worktree management for pi: create/list/merge/remove with safety rails, no shell interpolation, Windows-first, zero tmux",
   "keywords": [
     "pi-package",

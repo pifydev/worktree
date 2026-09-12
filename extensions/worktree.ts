@@ -198,6 +198,7 @@ export default function worktree(pi: ExtensionAPI) {
   pi.registerTool({
     name: "worktree_list",
     label: "List worktrees",
+    promptSnippet: "Git worktrees for this repository, and their branches",
     description:
       "List the repository's git worktrees with branch, dirty/locked/prunable state, and which one " +
       "is primary. Use before creating, removing, or merging.",
@@ -211,6 +212,7 @@ export default function worktree(pi: ExtensionAPI) {
   pi.registerTool({
     name: "worktree_create",
     label: "Create worktree",
+    promptSnippet: "Make an isolated git worktree to work in",
     description:
       "Create an isolated git worktree under ~/.worktrees/<repo>/ for parallel work that modifies " +
       "files. branch: a new branch (created from base, default HEAD) or an existing unoccupied local " +
@@ -253,6 +255,7 @@ export default function worktree(pi: ExtensionAPI) {
   pi.registerTool({
     name: "worktree_remove",
     label: "Remove worktree",
+    promptSnippet: "Remove a worktree, reporting anything uncommitted first",
     description:
       "Remove a worktree by branch name or path. Refuses the primary worktree, the one this session " +
       "runs in, and locked ones; uncommitted changes need the user's confirmation (denied when no UI). " +
@@ -304,6 +307,7 @@ export default function worktree(pi: ExtensionAPI) {
   pi.registerTool({
     name: "worktree_merge",
     label: "Merge worktree",
+    promptSnippet: "Merge a worktree's branch back and clean it up",
     description:
       "Merge a worktree's branch into the primary worktree's current branch (with the user's " +
       "confirmation), then remove the worktree on success. Conflicting merges abort cleanly and " +
