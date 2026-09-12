@@ -36,6 +36,7 @@ import {
   repoToplevel,
 } from "../src/git.ts";
 import { assessRemoval, formatWorktrees, resolveWorktree, validBranchName } from "../src/parse.ts";
+import { withUiLock } from "../src/ui-lock.ts";
 import {
   WORKTREE_SESSION_ENTRY,
   enteredNote,
@@ -95,10 +96,10 @@ export default function worktree(pi: ExtensionAPI) {
     }
 
     const sourceBranch = source.branch ?? branch;
-    const approved = await ctx.ui.confirm(
+    const approved = await withUiLock(() => ctx.ui.confirm(
       "Merge worktree",
       `Merge branch "${sourceBranch}" into "${primary.branch ?? "the primary branch"}" and remove ${source.path}?`,
-    );
+    ));
     if (!approved) {
       return { text: "The user declined the merge.", branch: sourceBranch, removed: false, merged: false };
     }
@@ -281,10 +282,10 @@ export default function worktree(pi: ExtensionAPI) {
             `Refusing to remove ${target.path}: ${risk.reasons.join("; ")} (no UI to confirm — fail-closed).`,
           );
         }
-        const approved = await uiCtx.ui.confirm(
+        const approved = await withUiLock(() => uiCtx.ui.confirm(
           "Remove dirty worktree",
           `${target.path} has uncommitted changes that will be LOST. Remove anyway?`,
-        );
+        ));
         if (!approved) {
           return {
             content: [{ type: "text", text: "The user declined. Worktree kept." }],
@@ -388,10 +389,10 @@ export default function worktree(pi: ExtensionAPI) {
               return;
             }
             if (dirty) {
-              const approved = await ctx.ui.confirm(
+              const approved = await withUiLock(() => ctx.ui.confirm(
                 "Remove dirty worktree",
                 `${target.path} has uncommitted changes that will be LOST. Remove anyway?`,
-              );
+              ));
               if (!approved) return;
             }
             const result = removeWorktree(ctx.cwd, target.path, dirty);
