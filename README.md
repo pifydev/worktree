@@ -1,5 +1,7 @@
 # @pify/worktree
 
+[![npm version](https://img.shields.io/npm/v/@pify/worktree)](https://www.npmjs.com/package/@pify/worktree) [![npm downloads](https://img.shields.io/npm/dm/@pify/worktree)](https://www.npmjs.com/package/@pify/worktree)
+
 Safe git-worktree management for [pi](https://github.com/earendil-works/pi) — isolated workspaces for parallel or risky changes, with safety rails on every destructive path and a clean merge-back flow. Windows-first: no tmux, no daemons, no shell interpolation.
 
 Part of the [Pify suite](https://github.com/pifydev). Install with [`pify install worktree`](https://github.com/pifydev/cli) or `pi install npm:@pify/worktree`.
