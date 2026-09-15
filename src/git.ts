@@ -95,7 +95,9 @@ export function createWorktree(cwd: string, branch: string, base?: string): Crea
         message: `Branch "${branch}" is already checked out at ${occupied.path}.`,
       };
     }
-    const result = git(cwd, ["worktree", "add", path, branch]);
+    // "--" ends option parsing so path/branch can never be read as flags even
+    // if validation upstream is ever bypassed (defense in depth vs arg injection).
+    const result = git(cwd, ["worktree", "add", "--", path, branch]);
     return {
       ok: result.ok,
       path,
@@ -106,7 +108,7 @@ export function createWorktree(cwd: string, branch: string, base?: string): Crea
   }
 
   const baseRef = base ?? "HEAD";
-  const result = git(cwd, ["worktree", "add", "-b", branch, path, baseRef]);
+  const result = git(cwd, ["worktree", "add", "-b", branch, "--", path, baseRef]);
   return {
     ok: result.ok,
     path,

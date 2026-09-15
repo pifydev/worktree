@@ -75,6 +75,19 @@ export function validBranchName(name: string): boolean {
   return /^[A-Za-z0-9._\-/]+$/.test(name);
 }
 
+/**
+ * Base-ref safety for `git worktree add <base>`: either a ref name that passes
+ * validBranchName (so it can never begin with '-') or a raw commit SHA. The base
+ * is forwarded straight into git's argv, so a '-'-prefixed value ("--force",
+ * "-C") would otherwise be parsed as an OPTION rather than a ref — argument
+ * injection. Same guard the worktree_create tool applies, shared so /worktree
+ * create cannot drift out of sync.
+ */
+export function validBaseRef(ref: string): boolean {
+  const trimmed = ref.trim();
+  return validBranchName(trimmed) || /^[0-9a-f]{4,40}$/i.test(trimmed);
+}
+
 /** Filesystem-safe directory name for a branch (feature/x → feature-x). */
 export function branchToDirName(branch: string): string {
   return branch.replace(/\//g, "-").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 100);

@@ -11,6 +11,7 @@ import {
   resolveWorktree,
   formatWorktrees,
   parseWorktreeList,
+  validBaseRef,
   validBranchName,
   type WorktreeInfo,
 } from "../src/parse.ts";
@@ -59,6 +60,16 @@ test("validBranchName accepts sane names, rejects tricks", () => {
   }
   for (const bad of ["-rf", "/abs", "trailing/", "a..b", "a//b", "x.lock", "@", "a@{b}", "sp ace", "semi;colon", ""]) {
     assert.ok(!validBranchName(bad), bad);
+  }
+});
+
+test("validBaseRef accepts refs/SHAs, rejects '-'-prefixed argv injection", () => {
+  for (const ok of ["HEAD", "main", "origin/main", "release/v1.2.3", "  main  ", "0f1e2d3", "0123456789abcdef0123456789abcdef01234567"]) {
+    assert.ok(validBaseRef(ok), ok);
+  }
+  // A leading '-' would be parsed by git as an OPTION (argument injection).
+  for (const bad of ["--force", "-C", "-f", "--orphan", "- ", "sp ace", "a..b", ""]) {
+    assert.ok(!validBaseRef(bad), bad);
   }
 });
 
@@ -146,6 +157,26 @@ test("create → list → dirty → merge → remove round-trip on a real repo",
     const removal = removeWorktree(repo, result.path, false);
     assert.ok(removal.ok, removal.output);
     assert.equal(listWorktrees(repo).length, 1);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    for (const p of created) rmSync(p, { recursive: true, force: true });
+  }
+});
+
+test("create neutralizes a '-'-prefixed base ref (git argument injection)", () => {
+  const repo = makeRepo();
+  const created: string[] = [];
+  try {
+    // Before the "--" separator, `git worktree add -b b <path> --force` parsed
+    // "--force" as an OPTION and silently created the worktree. With "--" it is
+    // read as a (nonexistent) ref, so git refuses and nothing is created.
+    const result = createWorktree(repo, "inject-branch", "--force");
+    if (result.path) created.push(result.path);
+    assert.ok(!result.ok, "a '-'-prefixed base ref must not create a worktree");
+    assert.match(result.message, /invalid reference|unknown option|fatal/i);
+    const list = listWorktrees(repo);
+    assert.equal(list.length, 1, "no rogue worktree should exist");
+    assert.ok(!list.some((w) => w.branch === "inject-branch"));
   } finally {
     rmSync(repo, { recursive: true, force: true });
     for (const p of created) rmSync(p, { recursive: true, force: true });

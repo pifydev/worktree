@@ -35,7 +35,7 @@ import {
   removeWorktree,
   repoToplevel,
 } from "../src/git.ts";
-import { assessRemoval, formatWorktrees, resolveWorktree, validBranchName } from "../src/parse.ts";
+import { assessRemoval, formatWorktrees, resolveWorktree, validBaseRef, validBranchName } from "../src/parse.ts";
 import { withUiLock } from "../src/ui-lock.ts";
 import {
   WORKTREE_SESSION_ENTRY,
@@ -229,7 +229,7 @@ export default function worktree(pi: ExtensionAPI) {
       if (!validBranchName(branch)) {
         throw new Error(`Invalid branch name ${JSON.stringify(params.branch)}.`);
       }
-      if (params.base !== undefined && !validBranchName(params.base.trim()) && !/^[0-9a-f]{4,40}$/i.test(params.base.trim())) {
+      if (params.base !== undefined && !validBaseRef(params.base)) {
         throw new Error(`Invalid base ref ${JSON.stringify(params.base)}.`);
       }
       const result = createWorktree((ctx as UiContext).cwd, branch, params.base?.trim());
@@ -353,6 +353,12 @@ export default function worktree(pi: ExtensionAPI) {
             }
             if (!validBranchName(arg)) {
               ctx.ui.notify(`Invalid branch name "${arg}".`, "warning");
+              return;
+            }
+            // The base ref is forwarded straight to git's argv; a '-'-prefixed
+            // token ("--force", "-C") would become an OPTION — argument injection.
+            if (base !== undefined && !validBaseRef(base)) {
+              ctx.ui.notify(`Invalid base ref "${base}".`, "warning");
               return;
             }
             const result = createWorktree(ctx.cwd, arg, base);
