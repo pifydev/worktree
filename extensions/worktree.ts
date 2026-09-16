@@ -36,6 +36,7 @@ import {
   repoToplevel,
 } from "../src/git.ts";
 import { assessRemoval, formatWorktrees, resolveWorktree, validBaseRef, validBranchName } from "../src/parse.ts";
+import { runMerge } from "../src/merge.ts";
 import { withUiLock } from "../src/ui-lock.ts";
 import {
   WORKTREE_SESSION_ENTRY,
@@ -69,54 +70,20 @@ export default function worktree(pi: ExtensionAPI) {
   /**
    * Merge a worktree branch back into the primary worktree and remove the
    * worktree. Shared by the tool and the /worktree route so both halves of
-   * the isolation loop behave identically. Throws on anything unsafe.
+   * the isolation loop behave identically. The orchestration (including the
+   * "keep the worktree the session is rooted in" rule) lives in src/merge.ts;
+   * here we only supply the pi-bound git/confirm dependencies. Throws on
+   * anything unsafe.
    */
-  async function mergeWorktree(
-    ctx: UiContext,
-    rawBranch: string,
-  ): Promise<{ text: string; branch: string; removed: boolean; merged: boolean }> {
+  function mergeWorktree(ctx: UiContext, rawBranch: string, signal?: AbortSignal) {
     requireRepo(ctx);
-    const branch = rawBranch.trim();
-    if (!validBranchName(branch)) throw new Error(`Invalid branch name ${JSON.stringify(rawBranch)}.`);
-
-    const worktrees = listWorktrees(ctx.cwd);
-    const primary = worktrees.find((w) => w.primary);
-    const source = resolveWorktree(worktrees, branch);
-    if (!primary) throw new Error("Could not locate the primary worktree.");
-    if (!source) throw new Error(`No worktree has branch "${branch}". Use worktree_list.`);
-    if (source.primary) throw new Error("That is the primary worktree's own branch.");
-    if (isDirty(source.path)) {
-      throw new Error(`Worktree ${source.path} has uncommitted changes — commit them there first.`);
-    }
-    if (isDirty(primary.path)) {
-      throw new Error(`The primary worktree has uncommitted changes — commit or stash them first.`);
-    }
-    if (!ctx.hasUI) {
-      throw new Error("Merging needs the user's confirmation and no UI is available (fail-closed).");
-    }
-
-    const sourceBranch = source.branch ?? branch;
-    const approved = await withUiLock(() => ctx.ui.confirm(
-      "Merge worktree",
-      `Merge branch "${sourceBranch}" into "${primary.branch ?? "the primary branch"}" and remove ${source.path}?`,
-    ));
-    if (!approved) {
-      return { text: "The user declined the merge.", branch: sourceBranch, removed: false, merged: false };
-    }
-
-    const merge = mergeBranch(primary.path, sourceBranch);
-    if (!merge.ok) throw new Error(merge.message);
-
-    const removal = removeWorktree(ctx.cwd, source.path, false);
-    const cleanup = removal.ok
-      ? `Worktree ${source.path} removed (branch kept).`
-      : `Merge done, but removing the worktree failed: ${removal.output}`;
-    return {
-      text: `Merged "${sourceBranch}" into ${primary.branch ?? "primary"}.\n${cleanup}`,
-      branch: sourceBranch,
-      removed: removal.ok,
-      merged: true,
-    };
+    return runMerge(ctx.cwd, listWorktrees(ctx.cwd), rawBranch, {
+      hasUI: ctx.hasUI,
+      isDirty,
+      confirm: (title, message) => withUiLock(() => ctx.ui.confirm(title, message)),
+      mergeBranch: (primaryPath, branch) => mergeBranch(primaryPath, branch, { signal }),
+      removeWorktree: (cwd, path, force) => removeWorktree(cwd, path, force, { signal }),
+    });
   }
 
   /**
@@ -169,26 +136,60 @@ export default function worktree(pi: ExtensionAPI) {
     }
   }
 
-  /** Return to the session this one was forked from. */
+  /**
+   * Leave the worktree, carrying the conversation back. Symmetric with enter:
+   * enter forks parent → worktree, exit forks the CURRENT (worktree) session
+   * back into the primary checkout, so everything discussed inside the worktree
+   * travels home instead of being frozen in the pre-enter parent file. The old
+   * parent file is left untouched.
+   */
   async function exitWorktree(ctx: CommandContext): Promise<void> {
     const state = readWorktreeSession(ctx.sessionManager.getBranch() as never);
     if (!state) {
       ctx.ui.notify("This session was not entered with /worktree enter.", "warning");
       return;
     }
-    if (!state.parentSession || !existsSync(state.parentSession)) {
-      ctx.ui.notify(
-        "The session this was forked from is gone, so there is nowhere to go back to. This session stays in the worktree.",
-        "warning",
-      );
+    if (typeof ctx.switchSession !== "function") {
+      ctx.ui.notify("This pi build cannot switch sessions, so /worktree exit is unavailable.", "error");
       return;
     }
+
+    const currentFile = ctx.sessionManager.getSessionFile() ?? null;
+    const primaryCwd = listWorktrees(ctx.cwd).find((w) => w.primary)?.path ?? null;
+
+    // Fall back to reopening the pre-enter parent file only if we cannot fork
+    // the conversation forward (no current file on disk, or the primary is not
+    // locatable). Better a frozen return than none.
+    if (!currentFile || !primaryCwd) {
+      if (!state.parentSession || !existsSync(state.parentSession)) {
+        ctx.ui.notify(
+          "The session this was forked from is gone, so there is nowhere to go back to. This session stays in the worktree.",
+          "warning",
+        );
+        return;
+      }
+      try {
+        await ctx.switchSession(state.parentSession, {
+          withSession: async (next) => next.ui.notify(exitNote(state), "info"),
+        });
+      } catch (err) {
+        ctx.ui.notify(`Could not exit: ${err instanceof Error ? err.message : String(err)}`, "error");
+      }
+      return;
+    }
+
     try {
-      await ctx.switchSession(state.parentSession, {
-        withSession: async (next) => {
-          next.ui.notify(exitNote(state), "info");
-        },
+      // Fork this session back into the primary checkout, then mark the state
+      // "left" so a second /worktree exit reads as "not in a worktree" instead
+      // of bouncing to the stale grandparent.
+      const replacement = SessionManager.forkFrom(currentFile, primaryCwd);
+      const replacementFile = replacement.getSessionFile();
+      if (!replacementFile) throw new Error("the forked session has no file");
+      replacement.appendCustomEntry(WORKTREE_SESSION_ENTRY, { ...state, left: true });
+      const { cancelled } = await ctx.switchSession(replacementFile, {
+        withSession: async (next) => next.ui.notify(exitNote(state), "info"),
       });
+      if (cancelled) ctx.ui.notify("Staying put — the session switch was cancelled.", "info");
     } catch (err) {
       ctx.ui.notify(`Could not exit: ${err instanceof Error ? err.message : String(err)}`, "error");
     }
@@ -223,7 +224,7 @@ export default function worktree(pi: ExtensionAPI) {
       branch: Type.String({ description: "Branch name (new or existing-unoccupied)" }),
       base: Type.Optional(Type.String({ description: "Base ref for a new branch (default HEAD)" })),
     }),
-    async execute(_id, params: { branch: string; base?: string }, _signal, _onUpdate, ctx) {
+    async execute(_id, params: { branch: string; base?: string }, signal, _onUpdate, ctx) {
       requireRepo(ctx as UiContext);
       const branch = params.branch.trim();
       if (!validBranchName(branch)) {
@@ -232,7 +233,7 @@ export default function worktree(pi: ExtensionAPI) {
       if (params.base !== undefined && !validBaseRef(params.base)) {
         throw new Error(`Invalid base ref ${JSON.stringify(params.base)}.`);
       }
-      const result = createWorktree((ctx as UiContext).cwd, branch, params.base?.trim());
+      const result = await createWorktree((ctx as UiContext).cwd, branch, params.base?.trim(), { signal });
       if (!result.ok) throw new Error(result.message);
       return {
         content: [
@@ -264,7 +265,7 @@ export default function worktree(pi: ExtensionAPI) {
     parameters: Type.Object({
       target: Type.String({ description: "Branch name or worktree path" }),
     }),
-    async execute(_id, params: { target: string }, _signal, _onUpdate, ctx) {
+    async execute(_id, params: { target: string }, signal, _onUpdate, ctx) {
       const uiCtx = ctx as UiContext;
       requireRepo(uiCtx);
       const target = resolveTarget(uiCtx, params.target.trim());
@@ -294,7 +295,7 @@ export default function worktree(pi: ExtensionAPI) {
         }
       }
 
-      const result = removeWorktree(uiCtx.cwd, target.path, dirty);
+      const result = await removeWorktree(uiCtx.cwd, target.path, dirty, { signal });
       if (!result.ok) throw new Error(result.output);
       return {
         content: [
@@ -316,8 +317,8 @@ export default function worktree(pi: ExtensionAPI) {
     parameters: Type.Object({
       branch: Type.String({ description: "Branch of the worktree to merge back" }),
     }),
-    async execute(_id, params: { branch: string }, _signal, _onUpdate, ctx) {
-      const result = await mergeWorktree(ctx as UiContext, params.branch);
+    async execute(_id, params: { branch: string }, signal, _onUpdate, ctx) {
+      const result = await mergeWorktree(ctx as UiContext, params.branch, signal);
       return {
         content: [{ type: "text", text: result.text }],
         details: { branch: result.branch, merged: result.merged, removed: result.removed },
@@ -361,7 +362,7 @@ export default function worktree(pi: ExtensionAPI) {
               ctx.ui.notify(`Invalid base ref "${base}".`, "warning");
               return;
             }
-            const result = createWorktree(ctx.cwd, arg, base);
+            const result = await createWorktree(ctx.cwd, arg, base);
             if (!result.ok) {
               ctx.ui.notify(result.message, "error");
               return;
@@ -401,7 +402,7 @@ export default function worktree(pi: ExtensionAPI) {
               ));
               if (!approved) return;
             }
-            const result = removeWorktree(ctx.cwd, target.path, dirty);
+            const result = await removeWorktree(ctx.cwd, target.path, dirty);
             ctx.ui.notify(result.ok ? `Removed ${target.path}.` : result.output, result.ok ? "info" : "error");
             return;
           }

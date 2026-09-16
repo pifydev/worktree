@@ -29,7 +29,11 @@ edits.
 4. Work happens in the worktree; commit there.
 5. `worktree_merge branch="feature-x"` — asks the user, merges into the
    primary branch, removes the worktree. Conflicts abort cleanly; nothing
-   is left half-merged.
+   is left half-merged. If the user ran `/worktree enter` first, so this
+   session is rooted *inside* that worktree, the merge keeps the worktree
+   (removing it would delete the session's own directory) and tells the user
+   to `/worktree exit` and then `worktree_remove` it — do not treat that as a
+   failure.
 6. `worktree_remove target="feature-x"` — abandon instead; dirty worktrees
    need the user's confirmation, the branch is always kept.
 

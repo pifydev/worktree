@@ -62,6 +62,23 @@ test("a session that never entered a worktree has no state", () => {
   assert.equal(readWorktreeSession([entry({ branch: "a" }), entry(null)]), null);
 });
 
+test("a 'left' marker clears the state so a second /worktree exit is a no-op", () => {
+  const base = { path: "D:/a", branch: "a", parentSession: "D:/s1.jsonl", created: true, enteredAt: 1 };
+  // /worktree exit appends the same state with left:true; the session is now
+  // back in the primary checkout and must read as "not in a worktree".
+  assert.equal(readWorktreeSession([entry(base), entry({ ...base, left: true })]), null);
+
+  // A fresh /worktree enter after leaving is still readable — its non-left
+  // entry comes after the marker and wins.
+  const reentered = readWorktreeSession([
+    entry(base),
+    entry({ ...base, left: true }),
+    entry({ path: "D:/b", branch: "b", parentSession: "D:/s2.jsonl", created: false, enteredAt: 2 }),
+  ]);
+  assert.equal(reentered?.path, "D:/b");
+  assert.equal(reentered?.created, false);
+});
+
 test("notes say where you are and how to get back", () => {
   const state = {
     path: "D:/repo-wt/feature",

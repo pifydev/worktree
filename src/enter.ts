@@ -27,6 +27,14 @@ export interface WorktreeSession {
   /** True when entering created the worktree, so leaving may offer to remove it. */
   created: boolean;
   enteredAt: number;
+  /**
+   * Set on the entry appended by /worktree exit: this session has LEFT the
+   * worktree (it forked the conversation back into the primary checkout).
+   * readWorktreeSession treats a left state as "no worktree state" so a second
+   * /worktree exit does not bounce again — an emptied entry cannot express this
+   * because readWorktreeSession keys off a non-empty path.
+   */
+  left?: boolean;
 }
 
 export interface BranchEntryLike {
@@ -43,6 +51,13 @@ export function readWorktreeSession(entries: readonly BranchEntryLike[]): Worktr
     if (entry.type !== "custom" || entry.customType !== WORKTREE_SESSION_ENTRY) continue;
     const data = entry.data as Partial<WorktreeSession> | null;
     if (!data || typeof data.path !== "string" || !data.path) continue;
+    // A "left" marker (written by /worktree exit) clears the state: this session
+    // has already returned to the primary checkout, so it is no longer rooted in
+    // a worktree. A later fresh enter appends its own non-left entry after it.
+    if (data.left === true) {
+      state = null;
+      continue;
+    }
     state = {
       path: data.path,
       branch: typeof data.branch === "string" ? data.branch : null,
@@ -130,7 +145,7 @@ export function enteredNote(session: WorktreeSession): string {
 
 export function exitNote(session: WorktreeSession): string {
   return [
-    `Left the worktree at ${session.path}.`,
+    `Left the worktree at ${session.path}; the conversation came back with you.`,
     session.created
       ? "It was created by entering, and is still there — /worktree remove drops it, worktree_merge merges it back."
       : "It is untouched.",

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   assessRemoval,
   branchToDirName,
@@ -15,7 +15,16 @@ import {
   validBranchName,
   type WorktreeInfo,
 } from "../src/parse.ts";
-import { createWorktree, isDirty, listWorktrees, mergeBranch, removeWorktree } from "../src/git.ts";
+import {
+  createWorktree,
+  failedAddCleanupPlan,
+  gitLong,
+  isDirty,
+  listWorktrees,
+  mergeBranch,
+  removeWorktree,
+} from "../src/git.ts";
+import { runMerge } from "../src/merge.ts";
 
 // ── Pure parsing/validation ──────────────────────────────────────────────
 
@@ -126,11 +135,11 @@ function makeRepo(): string {
   return dir;
 }
 
-test("create → list → dirty → merge → remove round-trip on a real repo", () => {
+test("create → list → dirty → merge → remove round-trip on a real repo", async () => {
   const repo = makeRepo();
   const created: string[] = [];
   try {
-    const result = createWorktree(repo, "feature-a");
+    const result = await createWorktree(repo, "feature-a");
     assert.ok(result.ok, result.message);
     assert.ok(result.createdBranch);
     created.push(result.path);
@@ -140,7 +149,7 @@ test("create → list → dirty → merge → remove round-trip on a real repo",
     assert.ok(list.some((w) => w.branch === "feature-a"));
 
     // occupied branch refuses a second worktree
-    const dup = createWorktree(repo, "feature-a");
+    const dup = await createWorktree(repo, "feature-a");
     assert.ok(!dup.ok);
     assert.ok(dup.message.includes("already checked out"));
 
@@ -151,10 +160,10 @@ test("create → list → dirty → merge → remove round-trip on a real repo",
     execFileSync("git", ["commit", "-m", "wt change"], { cwd: result.path, windowsHide: true });
     assert.ok(!isDirty(result.path));
 
-    const merge = mergeBranch(repo, "feature-a");
+    const merge = await mergeBranch(repo, "feature-a");
     assert.ok(merge.ok, merge.message);
 
-    const removal = removeWorktree(repo, result.path, false);
+    const removal = await removeWorktree(repo, result.path, false);
     assert.ok(removal.ok, removal.output);
     assert.equal(listWorktrees(repo).length, 1);
   } finally {
@@ -163,14 +172,14 @@ test("create → list → dirty → merge → remove round-trip on a real repo",
   }
 });
 
-test("create neutralizes a '-'-prefixed base ref (git argument injection)", () => {
+test("create neutralizes a '-'-prefixed base ref (git argument injection)", async () => {
   const repo = makeRepo();
   const created: string[] = [];
   try {
     // Before the "--" separator, `git worktree add -b b <path> --force` parsed
     // "--force" as an OPTION and silently created the worktree. With "--" it is
     // read as a (nonexistent) ref, so git refuses and nothing is created.
-    const result = createWorktree(repo, "inject-branch", "--force");
+    const result = await createWorktree(repo, "inject-branch", "--force");
     if (result.path) created.push(result.path);
     assert.ok(!result.ok, "a '-'-prefixed base ref must not create a worktree");
     assert.match(result.message, /invalid reference|unknown option|fatal/i);
@@ -183,11 +192,11 @@ test("create neutralizes a '-'-prefixed base ref (git argument injection)", () =
   }
 });
 
-test("conflicting merge aborts cleanly", () => {
+test("conflicting merge aborts cleanly", async () => {
   const repo = makeRepo();
   const created: string[] = [];
   try {
-    const result = createWorktree(repo, "conflict-branch");
+    const result = await createWorktree(repo, "conflict-branch");
     assert.ok(result.ok);
     created.push(result.path);
 
@@ -197,7 +206,7 @@ test("conflicting merge aborts cleanly", () => {
     writeFileSync(join(repo, "file.txt"), "main version\n");
     execFileSync("git", ["commit", "-am", "main"], { cwd: repo, windowsHide: true });
 
-    const merge = mergeBranch(repo, "conflict-branch");
+    const merge = await mergeBranch(repo, "conflict-branch");
     assert.ok(!merge.ok);
     assert.ok(merge.message.includes("aborted"));
     assert.ok(!isDirty(repo), "primary restored to clean state");
@@ -238,4 +247,127 @@ test("v0.2 resolveWorktree matches branch, namespace, path, and dir name", () =>
   assert.equal(resolveWorktree(trees, "wt-feature")!.branch, "feature/x");
   assert.equal(resolveWorktree(trees, "nope"), null);
   assert.equal(resolveWorktree(trees, "  "), null);
+});
+
+// ── f176: nested-create path derives from the PRIMARY worktree ────────────
+
+test("v0.3 creating from inside a worktree nests under the repo, not the linked branch", async () => {
+  const repo = makeRepo();
+  const created: string[] = [];
+  try {
+    const a = await createWorktree(repo, "feature-a");
+    assert.ok(a.ok, a.message);
+    created.push(a.path);
+
+    // From INSIDE feature-a, rev-parse --show-toplevel returns feature-a's root,
+    // so the pre-fix path would land in ~/.worktrees/feature-a/feature-b. The
+    // primary lookup keeps it beside feature-a under ~/.worktrees/<repo>/.
+    const b = await createWorktree(a.path, "feature-b");
+    assert.ok(b.ok, b.message);
+    created.push(b.path);
+    assert.equal(dirname(b.path), dirname(a.path), `${b.path} should sit beside ${a.path}`);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    for (const p of created) rmSync(p, { recursive: true, force: true });
+  }
+});
+
+// ── f175: merging from inside the worktree keeps it ───────────────────────
+
+function mergeDeps(overrides: Partial<Parameters<typeof runMerge>[3]> = {}) {
+  const calls: string[] = [];
+  const deps = {
+    hasUI: true,
+    isDirty: () => false,
+    confirm: async (_t: string, m: string) => {
+      calls.push(`confirm:${m}`);
+      return true;
+    },
+    mergeBranch: async () => {
+      calls.push("merge");
+      return { ok: true, message: "" };
+    },
+    removeWorktree: async () => {
+      calls.push("remove");
+      return { ok: true, output: "" };
+    },
+    ...overrides,
+  };
+  return { calls, deps };
+}
+
+const MERGE_TREES = [
+  info({ path: "/repo", branch: "main", primary: true }),
+  info({ path: "/repo-wt/feature", branch: "feature" }),
+];
+
+test("v0.3 runMerge keeps the worktree when the session is rooted inside it", async () => {
+  const { calls, deps } = mergeDeps();
+  const outcome = await runMerge("/repo-wt/feature/src", MERGE_TREES, "feature", deps);
+  assert.equal(outcome.merged, true);
+  assert.equal(outcome.removed, false);
+  assert.ok(calls.includes("merge"), "merge still happens");
+  assert.ok(!calls.includes("remove"), "must not remove the worktree it is rooted in");
+  assert.ok(calls.some((c) => c.startsWith("confirm:") && c.includes("keep")), "dialog says keep");
+  assert.match(outcome.text, /\/worktree exit/);
+});
+
+test("v0.3 runMerge removes the worktree when merging from outside it", async () => {
+  const { calls, deps } = mergeDeps();
+  const outcome = await runMerge("/repo", MERGE_TREES, "feature", deps);
+  assert.equal(outcome.merged, true);
+  assert.equal(outcome.removed, true);
+  assert.ok(calls.includes("remove"), "worktree removed when we are not inside it");
+  assert.ok(calls.some((c) => c.startsWith("confirm:") && c.includes("remove")), "dialog says remove");
+});
+
+test("v0.3 runMerge declined leaves the worktree untouched", async () => {
+  const { calls, deps } = mergeDeps({ confirm: async () => false });
+  const outcome = await runMerge("/repo", MERGE_TREES, "feature", deps);
+  assert.equal(outcome.merged, false);
+  assert.ok(!calls.includes("merge") && !calls.includes("remove"));
+});
+
+// ── f178: long-op timeout plumbing and post-kill cleanup ──────────────────
+
+test("v0.3 failedAddCleanupPlan unlocks before removing, prunes, and only deletes a created branch", () => {
+  const created = failedAddCleanupPlan("/wt/x", "feat", true).map((s) => s.args.join(" "));
+  assert.deepEqual(created, [
+    "worktree unlock /wt/x",
+    "worktree remove --force --force /wt/x",
+    "worktree prune",
+    "branch -D feat",
+  ]);
+  // An existing (pre-existing) branch must never be deleted by cleanup.
+  const existing = failedAddCleanupPlan("/wt/x", "feat", false).map((s) => s.args[0] + " " + s.args[1]);
+  assert.ok(!existing.some((c) => c === "branch -D"));
+  assert.equal(existing.length, 3);
+});
+
+test("v0.3 gitLong flags an aborted call rather than throwing", async () => {
+  const repo = makeRepo();
+  try {
+    const controller = new AbortController();
+    controller.abort();
+    const result = await gitLong(repo, ["status", "--porcelain"], { signal: controller.signal });
+    assert.equal(result.ok, false);
+    assert.equal(result.aborted, true);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("v0.3 createWorktree cleans up and reports when the add is aborted", async () => {
+  const repo = makeRepo();
+  try {
+    const controller = new AbortController();
+    controller.abort();
+    const result = await createWorktree(repo, "aborted-feat", undefined, { signal: controller.signal });
+    assert.equal(result.ok, false);
+    assert.match(result.message, /cancelled/i);
+    // Nothing should be left behind.
+    assert.ok(!listWorktrees(repo).some((w) => w.branch === "aborted-feat"));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
 });

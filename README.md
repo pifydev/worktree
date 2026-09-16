@@ -31,7 +31,7 @@ No parameters. Every worktree with its branch and `primary` / `dirty` / `locked`
 |---|---|---|
 | `branch` | string | Branch of the worktree to merge back |
 
-With your confirmation: merges into the primary worktree's branch, then removes the worktree (keeping the branch). Both sides must be clean first. **A conflicting merge aborts cleanly** — the primary is restored and nothing is left half-merged.
+With your confirmation: merges into the primary worktree's branch, then removes the worktree (keeping the branch). Both sides must be clean first. **A conflicting merge aborts cleanly** — the primary is restored and nothing is left half-merged. **If you merge from inside the worktree** (after `/worktree enter`), it is merged but *kept* — removing it would delete the directory this session runs in — and you are told to `/worktree exit` and then remove it.
 
 ### `worktree_remove`
 
@@ -45,7 +45,7 @@ Refuses the primary worktree, the one this session runs in, and locked ones outr
 
 Creating a worktree used to be half the job. pi binds `read`, `edit`, `bash` and `@` completion to the session's working directory, and a session cannot change its own — so the worktree existed, and everything you had just discussed stayed in the terminal you were in.
 
-`/worktree enter <branch|path>` forks the current session into the worktree and switches to it. The conversation comes along, the tools rebind, and the branch you were reading about is the branch you are now in. `/worktree exit` returns to the session you came from. `/worktree create <branch> --enter` does both in one step.
+`/worktree enter <branch|path>` forks the current session into the worktree and switches to it. The conversation comes along, the tools rebind, and the branch you were reading about is the branch you are now in. `/worktree exit` is symmetric: it forks the *current* conversation back into the main checkout, so everything you discussed inside the worktree comes home with you (it does not rewind to the moment you entered). `/worktree create <branch> --enter` does both in one step.
 
 Two refusals, each with a different fix:
 
@@ -59,7 +59,7 @@ Session switching is a user command, so **the agent cannot move itself**. That i
 `/worktree` — the same list as `worktree_list`.
 `/worktree create <branch> [base] [--enter]` — create, optionally entering it.
 `/worktree enter <branch|path>` — take the conversation into a worktree.
-`/worktree exit` — return to the session you came from.
+`/worktree exit` — carry the conversation back to the main checkout.
 `/worktree remove <branch|path>` — remove, with the same rails as the tool.
 `/worktree merge <branch>` — merge back and clean up.
 `/worktree prune` — drop administrative records for worktrees whose directories are gone.
@@ -75,6 +75,8 @@ A branch, a full path, a directory name — or, for worktrees created by `isolat
 Every git call is an `execFile` argv — no shell, no string interpolation, ever. Branch names are validated against a restricted grammar (no leading `-`, no `..`, no ref tricks) before they reach git.
 
 Removal risk is assessed before anything happens: primary, current-session, locked, and dirty are four distinct verdicts, and only dirty is confirmable. Containment is checked on directory boundaries, so sitting in `feature-2` does not block removing `feature`.
+
+The slow operations — `worktree add` (a full checkout), `worktree remove`, and `merge` — run asynchronously with a generous 10-minute deadline and are wired to the tool's cancel signal, so a big checkout no longer freezes pi and never trips the 30-second timeout used for the quick status/list calls. If one is cancelled or does hit its deadline, the half-created (and locked) worktree is cleaned up best-effort — unlock, force-remove, prune, and delete the branch only if this call created it — and the result says what was cleaned.
 
 Integration tests run the whole create → merge → remove flow, and the conflict-abort path, against real repositories rather than mocks.
 
